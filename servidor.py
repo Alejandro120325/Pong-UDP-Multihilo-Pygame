@@ -1,286 +1,425 @@
-"""Pong UDP multihilo: servidor que controla fisica, puntos y partida.
+"""Servidor autoritativo de Pong Neón, orientado a objetos, UDP y multihilo.
 
-Ejecucion: py servidor.py --bind 0.0.0.0 --puerto 5000
-No necesita Pygame: solo utiliza bibliotecas de Python.
+Ejemplo: python servidor.py --bind 0.0.0.0 --puerto 5000
+Solo depende de la biblioteca estándar de Python.
 """
 
 import argparse
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 import json
 import math
 import socket
 import threading
 import time
 
-ANCHO, ALTO = 1280, 720
-PUERTO = 5000
-RADIO = 20
-RAQUETA_ANCHO, RAQUETA_ALTO = 20, 150
-RAQUETA_X = {1: 40, 2: 1220}
-VELOCIDAD_RAQUETA = 460
-ACELERACION = 1.05              # +5 % por golpe de raqueta
-VELOCIDAD_MAXIMA = 900
-PUNTOS_PARA_GANAR = 7
-DESCONEXION_SEGUNDOS = 8
 
-# El estado de juego se comparte entre el hilo receptor y el principal.
-candado = threading.Lock()
-jugadores = {}  # (ip, puerto) -> informacion de cada jugador
-raquetas = {1: 285.0, 2: 285.0}
-puntos = {1: 0, 2: 0}
-bola_x, bola_y = 640.0, 360.0
-vx, vy = 350.0, 180.0
-pausado = False
-pausa_inicio = 0.0
-preparacion_hasta = time.monotonic() + 2.0
-ganador = None
-dos_conectados_antes = False
+@dataclass(frozen=True)
+class ConfiguracionJuego:
+    """Valores de la partida: cambiar reglas no requiere modificar las clases."""
 
-# Eventos de rebote/punto para efectos visuales de ambos clientes.
-evento_id = 0
-evento_tipo = ""
-evento_pos = [640, 360]
+    ancho: int = 1280
+    alto: int = 720
+    radio: int = 20
+    ancho_raqueta: int = 20
+    alto_raqueta: int = 150
+    velocidad_raqueta: float = 460.0
+    aceleracion: float = 1.05
+    velocidad_maxima: float = 900.0
+    meta: int = 7
+    tiempo_desconexion: float = 8.0
 
 
-def enviar(sock, direccion, mensaje):
-    try:
-        sock.sendto(json.dumps(mensaje).encode("utf-8"), direccion)
-    except OSError:
-        pass
+class Raqueta:
+    """Entidad: conoce su posición y cómo desplazarse sin salir de la cancha."""
+
+    def __init__(self, numero: int, x: int, y: float, config: ConfiguracionJuego):
+        self.numero = numero
+        self.x = x
+        self._y = float(y)
+        self._config = config
+
+    @property
+    def y(self) -> float:
+        return self._y
+
+    def reiniciar(self) -> None:
+        self._y = (self._config.alto - self._config.alto_raqueta) / 2
+
+    def mover(self, direccion: int, dt: float) -> None:
+        nueva_y = self._y + direccion * self._config.velocidad_raqueta * dt
+        self._y = max(0.0, min(self._config.alto - self._config.alto_raqueta, nueva_y))
+
+    def toca(self, bola: "Pelota") -> bool:
+        c = self._config
+        cerca_y = bola.y + c.radio >= self._y and bola.y - c.radio <= self._y + c.alto_raqueta
+        cerca_x = bola.x + c.radio >= self.x and bola.x - c.radio <= self.x + c.ancho_raqueta
+        viene_hacia_mi = bola.vx < 0 if self.numero == 1 else bola.vx > 0
+        return cerca_x and cerca_y and viene_hacia_mi
+
+    def impacto_relativo(self, y_bola: float) -> float:
+        mitad = self._config.alto_raqueta / 2
+        return max(-1.0, min(1.0, (y_bola - (self._y + mitad)) / mitad))
 
 
-def registrar_evento(tipo, x, y):
-    global evento_id, evento_tipo, evento_pos
-    evento_id += 1
-    evento_tipo = tipo
-    evento_pos = [round(x), round(y)]
+class Pelota:
+    """Entidad: física horizontal/vertical y rebote con raquetas o paredes."""
+
+    def __init__(self, config: ConfiguracionJuego):
+        self._config = config
+        self.x = config.ancho / 2
+        self.y = config.alto / 2
+        self.vx = 350.0
+        self.vy = 180.0
+
+    @property
+    def rapidez(self) -> float:
+        return math.hypot(self.vx, self.vy)
+
+    def reiniciar(self, sentido: int = 1) -> None:
+        self.x = self._config.ancho / 2
+        self.y = self._config.alto / 2
+        self.vx = 350.0 * sentido
+        self.vy = 180.0
+
+    def mover(self, dt: float) -> None:
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+    def rebotar_pared(self) -> bool:
+        """Devuelve True si hubo rebote en techo o suelo."""
+        if self.y - self._config.radio <= 0:
+            self.y = self._config.radio
+            self.vy = abs(self.vy)
+            return True
+        if self.y + self._config.radio >= self._config.alto:
+            self.y = self._config.alto - self._config.radio
+            self.vy = -abs(self.vy)
+            return True
+        return False
+
+    def rebotar_raqueta(self, raqueta: Raqueta) -> bool:
+        if not raqueta.toca(self):
+            return False
+        c = self._config
+        self.x = (raqueta.x + c.ancho_raqueta + c.radio
+                  if raqueta.numero == 1 else raqueta.x - c.radio)
+        rapidez = min(self.rapidez * c.aceleracion, c.velocidad_maxima)
+        dx = 1 if raqueta.numero == 1 else -1
+        dy = raqueta.impacto_relativo(self.y) * 0.9
+        norma = math.hypot(dx, dy)
+        self.vx = dx / norma * rapidez
+        self.vy = dy / norma * rapidez
+        return True
+
+    def jugador_que_anota(self) -> int | None:
+        if self.x + self._config.radio < 0:
+            return 2
+        if self.x - self._config.radio > self._config.ancho:
+            return 1
+        return None
 
 
-def reiniciar_bola(sentido=1):
-    global bola_x, bola_y, vx, vy, preparacion_hasta
-    bola_x, bola_y = ANCHO / 2, ALTO / 2
-    vx, vy = 350.0 * sentido, 180.0
-    preparacion_hasta = time.monotonic() + 1.5
+class Jugador:
+    """Mantiene el control y la actividad UDP de un participante."""
+
+    def __init__(self, numero: int, direccion: tuple[str, int]):
+        self.numero = numero
+        self.direccion = direccion
+        self.arriba = False
+        self.abajo = False
+        self.ultimo_paquete = time.monotonic()
+        self._secuencia = -1
+        self._ultimo_comando = -1
+
+    def actualizar_controles(self, mensaje: dict) -> tuple[str | None, bool]:
+        """Ignora datagramas antiguos y comandos repetidos.
+
+        Retorna (comando, es_valido) para que el juego tome las decisiones.
+        """
+        self.ultimo_paquete = time.monotonic()
+        secuencia = mensaje.get("secuencia", -1)
+        if type(secuencia) is not int or secuencia <= self._secuencia:
+            return None, False
+        self._secuencia = secuencia
+        self.arriba = mensaje.get("arriba") is True
+        self.abajo = mensaje.get("abajo") is True
+
+        comando = mensaje.get("comando")
+        comando_id = mensaje.get("comando_id", -1)
+        if (comando in ("p", "c", "r") and type(comando_id) is int
+                and comando_id > self._ultimo_comando):
+            self._ultimo_comando = comando_id
+            return comando, True
+        return None, True
+
+    def direccion_movimiento(self, ahora: float) -> int:
+        if ahora - self.ultimo_paquete > 0.35:
+            return 0  # Soltar movimiento si se pierde la señal.
+        return int(self.abajo) - int(self.arriba)
+
+    def desconectado(self, ahora: float, limite: float) -> bool:
+        return ahora - self.ultimo_paquete > limite
 
 
-def reiniciar_partida():
-    global pausado, pausa_inicio, ganador
-    puntos[1], puntos[2] = 0, 0
-    raquetas[1], raquetas[2] = 285.0, 285.0
-    ganador = None
-    pausado = False
-    pausa_inicio = 0.0
-    reiniciar_bola()
-    registrar_evento("reiniciar", 640, 360)
+class JuegoPong:
+    """Controlador del juego: reglas, participantes, puntuación y estado público."""
 
+    def __init__(self, config: ConfiguracionJuego):
+        self.config = config
+        self.pelota = Pelota(config)
+        self.raquetas = {
+            1: Raqueta(1, 40, 285, config),
+            2: Raqueta(2, 1220, 285, config),
+        }
+        self.jugadores: dict[tuple[str, int], Jugador] = {}
+        self.puntos = {1: 0, 2: 0}
+        self.pausado = False
+        self._pausa_inicio = 0.0
+        self._preparacion_hasta = time.monotonic() + 2.0
+        self.ganador: int | None = None
+        self._dos_antes = False
+        self._evento_id = 0
+        self._evento_tipo = ""
+        self._evento_pos = [config.ancho // 2, config.alto // 2]
 
-def recibir_mensajes(sock):
-    """Hilo secundario: recibe solicitudes, teclas y comandos por UDP."""
-    global pausado, pausa_inicio, preparacion_hasta
+    def _evento(self, tipo: str, x: float, y: float) -> None:
+        self._evento_id += 1
+        self._evento_tipo = tipo
+        self._evento_pos = [round(x), round(y)]
 
-    while True:
-        try:
-            datos, direccion = sock.recvfrom(4096)
-            mensaje = json.loads(datos.decode("utf-8"))
-            if not isinstance(mensaje, dict):
-                continue
-        except socket.timeout:
-            continue
-        except (ValueError, UnicodeDecodeError):
-            continue
-        except OSError:
-            break
+    def _reiniciar_pelota(self, sentido: int = 1) -> None:
+        self.pelota.reiniciar(sentido)
+        self._preparacion_hasta = time.monotonic() + 1.5
 
+    def reiniciar(self) -> None:
+        self.puntos = {1: 0, 2: 0}
+        for raqueta in self.raquetas.values():
+            raqueta.reiniciar()
+        self.ganador = None
+        self.pausado = False
+        self._pausa_inicio = 0.0
+        self._reiniciar_pelota()
+        self._evento("reiniciar", self.pelota.x, self.pelota.y)
+
+    def registrar(self, direccion: tuple[str, int]) -> dict:
+        jugador = self.jugadores.get(direccion)
+        if jugador is None:
+            ocupados = {j.numero for j in self.jugadores.values()}
+            numero = next((n for n in (1, 2) if n not in ocupados), None)
+            if numero is None:
+                return {"tipo": "lleno"}
+            jugador = Jugador(numero, direccion)
+            self.jugadores[direccion] = jugador
+            print(f"Jugador {numero} conectado: {direccion}", flush=True)
+        jugador.ultimo_paquete = time.monotonic()
+        return {"tipo": "bienvenido", "jugador": jugador.numero}
+
+    def procesar_paquete(self, mensaje: dict, direccion: tuple[str, int]) -> dict | None:
         tipo = mensaje.get("tipo")
-        respuesta = None
-        with candado:
-            jugador = jugadores.get(direccion)
-            if tipo == "unirse":
-                if jugador is None:
-                    ocupados = {j["numero"] for j in jugadores.values()}
-                    numero = next((n for n in (1, 2) if n not in ocupados), None)
-                    if numero is None:
-                        respuesta = {"tipo": "lleno"}
-                    else:
-                        jugador = {
-                            "numero": numero, "arriba": False, "abajo": False,
-                            "ultimo_paquete": time.monotonic(), "secuencia": -1,
-                            "ultimo_comando": -1,
-                        }
-                        jugadores[direccion] = jugador
-                        print(f"Jugador {numero} conectado: {direccion}", flush=True)
-                if jugador is not None:
-                    jugador["ultimo_paquete"] = time.monotonic()
-                    respuesta = {"tipo": "bienvenido", "jugador": jugador["numero"]}
+        if tipo == "unirse":
+            return self.registrar(direccion)
+        jugador = self.jugadores.get(direccion)
+        if jugador is None:
+            return None
+        if tipo == "salir":
+            del self.jugadores[direccion]
+            print(f"Jugador {jugador.numero} salio de la partida", flush=True)
+        elif tipo == "controles":
+            comando, _ = jugador.actualizar_controles(mensaje)
+            if comando is not None:
+                self._comando(comando, jugador.numero)
+        return None
 
-            elif tipo == "salir" and jugador is not None:
-                print(f"Jugador {jugador['numero']} salio de la partida", flush=True)
-                del jugadores[direccion]
+    def _comando(self, comando: str, numero: int) -> None:
+        ahora = time.monotonic()
+        if comando == "p" and not self.pausado and self.ganador is None:
+            self.pausado = True
+            self._pausa_inicio = ahora
+            print(f"Jugador {numero} PAUSO", flush=True)
+        elif comando == "c" and self.pausado:
+            self.pausado = False
+            self._preparacion_hasta += ahora - self._pausa_inicio
+            print(f"Jugador {numero} CONTINUO", flush=True)
+        elif comando == "r":
+            self.reiniciar()
+            print(f"Jugador {numero} REINICIO", flush=True)
 
-            elif tipo == "controles" and jugador is not None:
-                jugador["ultimo_paquete"] = time.monotonic()
-                secuencia = mensaje.get("secuencia", -1)
-                if type(secuencia) is not int or secuencia <= jugador["secuencia"]:
-                    continue  # UDP puede duplicar o reordenar los paquetes.
-                jugador["secuencia"] = secuencia
-                jugador["arriba"] = mensaje.get("arriba") is True
-                jugador["abajo"] = mensaje.get("abajo") is True
+    def actualizar(self, dt: float) -> None:
+        ahora = time.monotonic()
+        for direccion, jugador in list(self.jugadores.items()):
+            if jugador.desconectado(ahora, self.config.tiempo_desconexion):
+                print(f"Jugador {jugador.numero} desconectado", flush=True)
+                del self.jugadores[direccion]
 
-                comando = mensaje.get("comando")
-                comando_id = mensaje.get("comando_id", -1)
-                if (comando in ("p", "c", "r") and type(comando_id) is int
-                        and comando_id > jugador["ultimo_comando"]):
-                    jugador["ultimo_comando"] = comando_id
-                    if comando == "p" and not pausado and ganador is None:
-                        pausado = True
-                        pausa_inicio = time.monotonic()
-                        print(f"Jugador {jugador['numero']} PAUSO", flush=True)
-                    elif comando == "c" and pausado:
-                        pausado = False
-                        preparacion_hasta += time.monotonic() - pausa_inicio
-                        print(f"Jugador {jugador['numero']} CONTINUO", flush=True)
-                    elif comando == "r":
-                        reiniciar_partida()
-                        print(f"Jugador {jugador['numero']} REINICIO", flush=True)
+        ambos = len(self.jugadores) == 2
+        if ambos and not self._dos_antes:
+            self._preparacion_hasta = ahora + 1.5
+            print("Dos jugadores listos. Comienza Pong.", flush=True)
+        self._dos_antes = ambos
 
-        if respuesta is not None:
-            enviar(sock, direccion, respuesta)
+        if not ambos or self.pausado or self.ganador is not None:
+            return
 
+        for jugador in self.jugadores.values():
+            self.raquetas[jugador.numero].mover(jugador.direccion_movimiento(ahora), dt)
+        if ahora < self._preparacion_hasta:
+            return
 
-def actualizar_juego(dt):
-    """Hilo principal: mueve raquetas/bola y decide colisiones/puntos."""
-    global bola_x, bola_y, vx, vy, ganador, dos_conectados_antes, preparacion_hasta
-    ahora = time.monotonic()
+        self.pelota.mover(dt)
+        if self.pelota.rebotar_pared():
+            self._evento("pared", self.pelota.x, self.pelota.y)
 
-    for direccion, jugador in list(jugadores.items()):
-        if ahora - jugador["ultimo_paquete"] > DESCONEXION_SEGUNDOS:
-            print(f"Jugador {jugador['numero']} desconectado", flush=True)
-            del jugadores[direccion]
+        for raqueta in self.raquetas.values():
+            if self.pelota.rebotar_raqueta(raqueta):
+                self._evento("raqueta", self.pelota.x, self.pelota.y)
+                print(f"Golpe jugador {raqueta.numero}: {self.pelota.rapidez:.0f} px/s", flush=True)
+                break
 
-    ambos = len(jugadores) == 2
-    if ambos and not dos_conectados_antes:
-        preparacion_hasta = ahora + 1.5
-        print("Dos jugadores listos. Comienza Pong.", flush=True)
-    dos_conectados_antes = ambos
+        anota = self.pelota.jugador_que_anota()
+        if anota is not None:
+            self.puntos[anota] += 1
+            self._evento("punto", self.pelota.x, self.pelota.y)
+            print(f"PUNTO J{anota}: {self.puntos[1]} - {self.puntos[2]}", flush=True)
+            if self.puntos[anota] >= self.config.meta:
+                self.ganador = anota
+                self.pelota.x = self.config.ancho / 2
+                self.pelota.y = self.config.alto / 2
+                print(f"GANADOR: JUGADOR {anota}. Pulsa R para reiniciar", flush=True)
+            else:
+                self._reiniciar_pelota(sentido=1 if anota == 2 else -1)
 
-    if not ambos or pausado or ganador is not None:
-        return
-
-    # Movimiento autoritativo de cada raqueta.
-    for jugador in jugadores.values():
-        numero = jugador["numero"]
-        movimiento = int(jugador["abajo"]) - int(jugador["arriba"])
-        if ahora - jugador["ultimo_paquete"] > 0.35:
-            movimiento = 0
-        raquetas[numero] += movimiento * VELOCIDAD_RAQUETA * dt
-        raquetas[numero] = max(0, min(ALTO - RAQUETA_ALTO, raquetas[numero]))
-
-    if ahora < preparacion_hasta:
-        return  # Breve cuenta regresiva antes del saque.
-
-    bola_x += vx * dt
-    bola_y += vy * dt
-
-    # Rebotes techo/suelo.
-    if bola_y - RADIO <= 0:
-        bola_y = RADIO
-        vy = abs(vy)
-        registrar_evento("pared", bola_x, bola_y)
-    elif bola_y + RADIO >= ALTO:
-        bola_y = ALTO - RADIO
-        vy = -abs(vy)
-        registrar_evento("pared", bola_x, bola_y)
-
-    # Rebote con raquetas: el punto de impacto cambia el angulo.
-    for numero in (1, 2):
-        x, y = RAQUETA_X[numero], raquetas[numero]
-        cerca_y = bola_y + RADIO >= y and bola_y - RADIO <= y + RAQUETA_ALTO
-        if numero == 1:
-            cerca_x = bola_x - RADIO <= x + RAQUETA_ANCHO and bola_x + RADIO >= x
-            acerca = vx < 0
-        else:
-            cerca_x = bola_x + RADIO >= x and bola_x - RADIO <= x + RAQUETA_ANCHO
-            acerca = vx > 0
-
-        if cerca_y and cerca_x and acerca:
-            bola_x = x + RAQUETA_ANCHO + RADIO if numero == 1 else x - RADIO
-            rapidez = min(math.hypot(vx, vy) * ACELERACION, VELOCIDAD_MAXIMA)
-            impacto = (bola_y - (y + RAQUETA_ALTO / 2)) / (RAQUETA_ALTO / 2)
-            impacto = max(-1.0, min(1.0, impacto))
-            sentido = 1 if numero == 1 else -1
-            dx, dy = sentido, impacto * 0.9
-            norma = math.hypot(dx, dy)
-            vx, vy = dx / norma * rapidez, dy / norma * rapidez
-            registrar_evento("raqueta", bola_x, bola_y)
-            print(f"Golpe jugador {numero}: {rapidez:.0f} px/s", flush=True)
-            break
-
-    # Si falla una raqueta, punto para el rival.
-    anota = 2 if bola_x + RADIO < 0 else 1 if bola_x - RADIO > ANCHO else None
-    if anota is not None:
-        puntos[anota] += 1
-        registrar_evento("punto", bola_x, bola_y)
-        print(f"PUNTO J{anota}: {puntos[1]} - {puntos[2]}", flush=True)
-        if puntos[anota] >= PUNTOS_PARA_GANAR:
-            ganador = anota
-            bola_x, bola_y = 640.0, 360.0
-            print(f"¡GANADOR: JUGADOR {anota}! Presiona R para reiniciar", flush=True)
-        else:
-            reiniciar_bola(sentido=1 if anota == 2 else -1)
+    def obtener_estado(self, secuencia: int) -> dict:
+        ahora = self._pausa_inicio if self.pausado else time.monotonic()
+        return {
+            "tipo": "estado", "secuencia_estado": secuencia,
+            "bola": [round(self.pelota.x, 2), round(self.pelota.y, 2)],
+            "raquetas": [round(self.raquetas[1].y, 2), round(self.raquetas[2].y, 2)],
+            "puntos": [self.puntos[1], self.puntos[2]],
+            "rapidez": round(self.pelota.rapidez),
+            "pausado": self.pausado,
+            "conectados": len(self.jugadores),
+            "ganador": self.ganador,
+            "espera": round(max(0, self._preparacion_hasta - ahora), 2),
+            "evento_id": self._evento_id,
+            "evento_tipo": self._evento_tipo,
+            "evento_pos": self._evento_pos.copy(),
+            "meta": self.config.meta,
+        }
 
 
-def obtener_estado(secuencia):
-    return {
-        "tipo": "estado", "secuencia_estado": secuencia,
-        "bola": [round(bola_x, 2), round(bola_y, 2)],
-        "raquetas": [round(raquetas[1], 2), round(raquetas[2], 2)],
-        "puntos": [puntos[1], puntos[2]],
-        "rapidez": round(math.hypot(vx, vy)),
-        "pausado": pausado, "conectados": len(jugadores),
-        "ganador": ganador,
-        "espera": round(max(0, preparacion_hasta - (pausa_inicio if pausado else time.monotonic())), 2),
-        "evento_id": evento_id, "evento_tipo": evento_tipo, "evento_pos": evento_pos,
-        "meta": PUNTOS_PARA_GANAR,
-    }
+class Transporte(ABC):
+    """Contrato pequeño que permite sustituir la implementación de red (DIP)."""
+
+    @abstractmethod
+    def recibir(self) -> tuple[dict, tuple[str, int]] | None:
+        """Recibe un mensaje y la dirección del remitente."""
+
+    @abstractmethod
+    def enviar(self, mensaje: dict, direccion: tuple[str, int]) -> None:
+        """Envía un mensaje a un cliente."""
+
+    @abstractmethod
+    def cerrar(self) -> None:
+        """Libera recursos."""
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Servidor de Pong UDP multihilo")
-    parser.add_argument("--bind", default="0.0.0.0", help="Interfaz de red del servidor")
-    parser.add_argument("--puerto", type=int, default=PUERTO)
+class TransporteUDP(Transporte):
+    """Implementación de red real basada en datagramas UDP y JSON."""
+
+    def __init__(self, ip: str, puerto: int):
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.bind((ip, puerto))
+        self._socket.settimeout(0.25)
+
+    def recibir(self) -> tuple[dict, tuple[str, int]] | None:
+        try:
+            datos, direccion = self._socket.recvfrom(4096)
+            mensaje = json.loads(datos.decode("utf-8"))
+            return (mensaje, direccion) if isinstance(mensaje, dict) else None
+        except (socket.timeout, ValueError, UnicodeDecodeError, OSError):
+            return None
+
+    def enviar(self, mensaje: dict, direccion: tuple[str, int]) -> None:
+        try:
+            self._socket.sendto(json.dumps(mensaje).encode("utf-8"), direccion)
+        except OSError:
+            pass
+
+    def cerrar(self) -> None:
+        self._socket.close()
+
+
+class ServidorPong:
+    """Coordina los hilos: receptor UDP y bucle principal de la partida."""
+
+    def __init__(self, juego: JuegoPong, transporte: Transporte):
+        self._juego = juego
+        self._transporte = transporte
+        self._candado = threading.Lock()
+        self._activo = threading.Event()
+        self._activo.set()
+        self._hilo: threading.Thread | None = None
+
+    def _recibir_mensajes(self) -> None:
+        while self._activo.is_set():
+            paquete = self._transporte.recibir()
+            if paquete is None:
+                continue
+            mensaje, direccion = paquete
+            with self._candado:
+                respuesta = self._juego.procesar_paquete(mensaje, direccion)
+            if respuesta is not None:
+                self._transporte.enviar(respuesta, direccion)
+
+    def ejecutar(self) -> None:
+        self._hilo = threading.Thread(target=self._recibir_mensajes, name="ReceptorUDP", daemon=True)
+        self._hilo.start()
+        print("Esperando dos jugadores... Ctrl+C para detener", flush=True)
+        anterior = time.perf_counter()
+        ultimo_envio = 0.0
+        secuencia = 0
+        try:
+            while self._activo.is_set():
+                inicio = time.perf_counter()
+                dt = min(inicio - anterior, 0.05)
+                anterior = inicio
+                with self._candado:
+                    self._juego.actualizar(dt)
+                    estado = None
+                    if inicio - ultimo_envio >= 1 / 30:
+                        secuencia += 1
+                        estado = self._juego.obtener_estado(secuencia)
+                        destinos = list(self._juego.jugadores)
+                if estado is not None:
+                    for direccion in destinos:
+                        self._transporte.enviar(estado, direccion)
+                    ultimo_envio = inicio
+                time.sleep(max(0, 1 / 60 - (time.perf_counter() - inicio)))
+        except KeyboardInterrupt:
+            print("Servidor detenido")
+        finally:
+            self.detener()
+
+    def detener(self) -> None:
+        self._activo.clear()
+        self._transporte.cerrar()
+        if self._hilo and threading.current_thread() is not self._hilo:
+            self._hilo.join(timeout=0.5)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Pong Neon UDP - servidor con POO/SOLID")
+    parser.add_argument("--bind", default="0.0.0.0")
+    parser.add_argument("--puerto", type=int, default=5000)
     args = parser.parse_args()
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((args.bind, args.puerto))
-    sock.settimeout(0.25)
-    threading.Thread(target=recibir_mensajes, args=(sock,), daemon=True).start()
+    configuracion = ConfiguracionJuego()
+    juego = JuegoPong(configuracion)
+    transporte = TransporteUDP(args.bind, args.puerto)
+    servidor = ServidorPong(juego, transporte)
     print(f"Servidor UDP escuchando en {args.bind}:{args.puerto}", flush=True)
-    print("Esperando dos jugadores... Ctrl+C para detener", flush=True)
-
-    anterior = time.perf_counter()
-    ultimo_envio = 0.0
-    secuencia_estado = 0
-    try:
-        while True:
-            inicio = time.perf_counter()
-            dt = min(inicio - anterior, 0.05)
-            anterior = inicio
-            with candado:
-                actualizar_juego(dt)
-                direcciones = list(jugadores)
-                if inicio - ultimo_envio >= 1 / 30:
-                    secuencia_estado += 1
-                    datos = obtener_estado(secuencia_estado)
-                else:
-                    datos = None
-            if datos is not None:
-                for direccion in direcciones:
-                    enviar(sock, direccion, datos)
-                ultimo_envio = inicio
-            time.sleep(max(0, 1 / 60 - (time.perf_counter() - inicio)))
-    except KeyboardInterrupt:
-        print("Servidor detenido")
-    finally:
-        sock.close()
+    servidor.ejecutar()
 
 
 if __name__ == "__main__":
